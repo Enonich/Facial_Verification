@@ -123,6 +123,11 @@ async def extract_face_from_id(file: UploadFile = File(...)):
             return JSONResponse(content={
                 "success": False,
                 "message": "No face detected in the ID document",
+                "error_code": "NO_FACE_DETECTED",
+                "error_stage": "id_extraction",
+                "stage_description": "Extracting face from ID document",
+                "details": "The system could not detect a face in the uploaded ID document.",
+                "recommendation": "Please ensure your ID photo is clear, the face is visible, and the image is not blurry or obstructed.",
                 "face_image_url": None,
                 "confidence": 0.0,
                 "bbox": None
@@ -132,10 +137,15 @@ async def extract_face_from_id(file: UploadFile = File(...)):
         face_filename = Path(result["output_path"]).name
         face_url = f"/extracted/{face_filename}"
         
+        # Also get embedding path for direct verification
+        embedding_filename = Path(result.get("embedding_path", "")).name if result.get("embedding_path") else None
+        embedding_url = f"/extracted/{embedding_filename}" if embedding_filename else None
+        
         return JSONResponse(content={
             "success": True,
             "message": "Face extracted successfully",
             "face_image_url": face_url,
+            "embedding_url": embedding_url,
             "confidence": result["confidence"],
             "bbox": result["bbox"]
         })
@@ -173,18 +183,35 @@ async def liveness_check(file: UploadFile = File(...)):
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if frame is None:
-            raise HTTPException(status_code=400, detail="Invalid image data")
+            return JSONResponse(content={
+                "is_live": False,
+                "confidence": 0.0,
+                "message": "Invalid image data - could not decode image",
+                "error_code": "IMAGE_DECODE_FAILED",
+                "error_stage": "image_loading",
+                "bbox": None,
+                "status": "error"
+            })
         
         # Run anti-spoofing detection
         is_live, message, confidence, bbox = antispoofing_engine.verify(frame)
         
-        return JSONResponse(content={
+        response_data = {
             "is_live": is_live,
             "confidence": confidence,
             "message": message,
             "bbox": bbox,
             "status": "success"
-        })
+        }
+        
+        if not is_live:
+            response_data["error_code"] = "LIVENESS_FAILED"
+            response_data["error_stage"] = "liveness_check"
+            response_data["stage_description"] = "Verifying live presence"
+            response_data["details"] = "The system detected that the image may be a spoof attempt (printed photo, screen display, or mask)."
+            response_data["recommendation"] = "Please use a live camera in good lighting. Ensure your face is clearly visible and not obscured."
+        
+        return JSONResponse(content=response_data)
     
     except Exception as e:
         return JSONResponse(
@@ -234,13 +261,28 @@ async def verify_identity(
             id_file_path = Path(id_face_path)
         
         if not id_file_path.exists():
+            # Clean up temp file before returning error
+            if live_temp_path.exists():
+                live_temp_path.unlink()
             raise HTTPException(status_code=404, detail=f"ID face not found: {id_face_path}")
         
-        # Perform verification
-        verification_result = face_verifier.verify(
-            id_photo_path=str(id_file_path),
-            live_photo_path=str(live_temp_path)
-        )
+        # Try to use pre-computed embedding first (more reliable)
+        # The embedding file should be named like: originalname_face_embedding.npy
+        embedding_filename = id_file_path.stem + "_embedding.npy"
+        embedding_path = EXTRACTED_FACES_DIR / embedding_filename
+        
+        if embedding_path.exists():
+            # Use pre-computed embedding for verification (more reliable)
+            verification_result = face_verifier.verify_with_embedding(
+                id_embedding_path=str(embedding_path),
+                live_photo_path=str(live_temp_path)
+            )
+        else:
+            # Fall back to image-based verification
+            verification_result = face_verifier.verify(
+                id_photo_path=str(id_file_path),
+                live_photo_path=str(live_temp_path)
+            )
         
         # Clean up temp file
         live_temp_path.unlink()
@@ -251,6 +293,11 @@ async def verify_identity(
                 "similarity": 0.0,
                 "confidence": 0.0,
                 "message": verification_result.get('error', 'Verification failed'),
+                "error_code": verification_result.get('error_code', 'UNKNOWN_ERROR'),
+                "error_stage": verification_result.get('error_stage', 'unknown'),
+                "stage_description": verification_result.get('stage_description', 'Unknown stage'),
+                "details": verification_result.get('details', ''),
+                "recommendation": verification_result.get('recommendation', 'Please try again.'),
                 "status": "error"
             })
         
@@ -269,17 +316,29 @@ async def verify_identity(
             confidence_level = "low"
             confidence = 0.5
         
-        message = f"Identity {'verified' if is_match else 'not verified'} - {confidence_level} confidence"
-        
-        return JSONResponse(content={
+        # Build response with detailed information
+        response_data = {
             "verified": is_match,
             "similarity": float(similarity),
+            "similarity_percentage": verification_result.get('similarity_percentage', round(similarity * 100, 2)),
             "confidence": float(confidence),
             "confidence_level": confidence_level,
-            "message": message,
+            "match_confidence": verification_result.get('match_confidence', 'unknown'),
+            "match_description": verification_result.get('match_description', ''),
+            "threshold": verification_result.get('threshold', 0.5),
+            "threshold_percentage": verification_result.get('threshold_percentage', 50.0),
+            "message": f"Identity {'verified' if is_match else 'not verified'} - {confidence_level} confidence",
             "processing_time": verification_result.get('processing_time_ms', 0),
             "status": "success"
-        })
+        }
+        
+        # Add failure details if verification failed
+        if not is_match:
+            # Providing details on why the match failed, but not marking as a system error
+            response_data["recommendation"] = verification_result.get('recommendation', 'Please try again with better lighting.')
+            response_data["non_match_reason"] = verification_result.get('match_description', 'Faces do not match')
+        
+        return JSONResponse(content=response_data)
     
     except Exception as e:
         return JSONResponse(
@@ -320,8 +379,13 @@ async def complete_verification(
         if id_result is None:
             return JSONResponse(content={
                 "success": False,
-                "stage": "id_extraction",
-                "message": "No face detected in ID document"
+                "verified": False,
+                "error_stage": "id_extraction",
+                "stage_description": "Extracting face from ID document",
+                "error_code": "ID_FACE_NOT_DETECTED",
+                "message": "No face detected in ID document",
+                "details": "The system could not detect a face in the uploaded ID document.",
+                "recommendation": "Please ensure your ID photo is clear, well-lit, and shows your full face without obstruction."
             })
         
         # Step 2: Check liveness
@@ -335,16 +399,31 @@ async def complete_verification(
         if not is_live:
             return JSONResponse(content={
                 "success": False,
-                "stage": "liveness_check",
+                "verified": False,
+                "error_stage": "liveness_check",
+                "stage_description": "Verifying live presence",
+                "error_code": "LIVENESS_FAILED",
                 "message": f"Liveness check failed: {liveness_msg}",
-                "liveness_confidence": liveness_conf
+                "liveness_confidence": liveness_conf,
+                "details": "The system detected that the captured image may not be from a live person.",
+                "recommendation": "Please ensure you are using a live camera (not a photo), have good lighting, and your face is clearly visible."
             })
         
-        # Step 3: Verify identity
-        verification_result = face_verifier.verify(
-            id_photo_path=id_result["output_path"],
-            live_photo_path=str(live_temp_path)
-        )
+        # Step 3: Verify identity using pre-computed embedding (more reliable)
+        embedding_path = id_result.get("embedding_path")
+        
+        if embedding_path and Path(embedding_path).exists():
+            # Use pre-computed embedding for verification
+            verification_result = face_verifier.verify_with_embedding(
+                id_embedding_path=embedding_path,
+                live_photo_path=str(live_temp_path)
+            )
+        else:
+            # Fall back to image-based verification
+            verification_result = face_verifier.verify(
+                id_photo_path=id_result["output_path"],
+                live_photo_path=str(live_temp_path)
+            )
         
         # Clean up
         id_temp_path.unlink()
@@ -353,19 +432,40 @@ async def complete_verification(
         if not verification_result.get('success', False):
             return JSONResponse(content={
                 "success": False,
-                "stage": "identity_verification",
-                "message": verification_result.get('error', 'Verification failed')
+                "verified": False,
+                "error_stage": verification_result.get('error_stage', 'identity_verification'),
+                "stage_description": verification_result.get('stage_description', 'Verifying identity'),
+                "error_code": verification_result.get('error_code', 'VERIFICATION_ERROR'),
+                "message": verification_result.get('error', 'Verification failed'),
+                "details": verification_result.get('details', ''),
+                "recommendation": verification_result.get('recommendation', 'Please try again.')
             })
         
-        return JSONResponse(content={
+        # Build comprehensive success response
+        is_match = verification_result.get('match', False)
+        
+        response_data = {
             "success": True,
-            "verified": verification_result.get('match', False),
+            "verified": is_match,
             "similarity": verification_result.get('similarity', 0.0),
+            "similarity_percentage": verification_result.get('similarity_percentage', 0.0),
+            "threshold": verification_result.get('threshold', 0.5),
+            "threshold_percentage": verification_result.get('threshold_percentage', 50.0),
+            "match_confidence": verification_result.get('match_confidence', 'unknown'),
+            "match_description": verification_result.get('match_description', ''),
             "liveness_confidence": liveness_conf,
             "id_extraction_confidence": id_result["confidence"],
-            "message": "Complete verification successful",
             "processing_time": verification_result.get('processing_time_ms', 0)
-        })
+        }
+        
+        if is_match:
+            response_data["message"] = "Complete verification successful - Identity verified!"
+        else:
+            response_data["message"] = f"Verification complete but identity NOT verified: {verification_result.get('match_description', 'Faces do not match')}"
+            response_data["recommendation"] = verification_result.get('recommendation', 'Please ensure you are the person shown in the ID document.')
+            response_data["non_match_reason"] = verification_result.get('match_description', 'Faces do not match')
+        
+        return JSONResponse(content=response_data)
     
     except Exception as e:
         return JSONResponse(

@@ -1,0 +1,235 @@
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    IDENTITY VERIFICATION SYSTEM                              ║
+║                        Integration Architecture                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              FRONTEND (React)                                │
+│                         frontend/src/App.jsx                                 │
+└────────────────┬─────────────────────────────────────────────────┬──────────┘
+                 │                                                 │
+                 │ HTTP POST                                       │ HTTP POST
+                 ▼                                                 ▼
+┌────────────────────────────────┐                  ┌─────────────────────────┐
+│  /extract-face                 │                  │  /liveness-check        │
+│  Extract face from ID          │                  │  Check if person is live│
+└────────────┬───────────────────┘                  └───────────┬─────────────┘
+             │                                                   │
+             │ Uses                                              │ Uses
+             ▼                                                   ▼
+┌────────────────────────────────┐                  ┌─────────────────────────┐
+│  IDFaceExtractor               │                  │  AntiSpoofingEngine     │
+│  (ID_Face_Ext.py)              │                  │  (antispoofing_engine.py│
+│                                │                  │                         │
+│  • DetecID face                │                  │  • MiniFASNet models    │
+│  • Extract & crop              │                  │  • Spoof detection      │
+│  • Save to Extracted_Faces/    │                  │  • Confidence scoring   │
+└────────────────────────────────┘                  └───────────┬─────────────┘
+                                                                 │
+                                                                 │ If is_live = True
+                                                                 ▼
+                                            ┌─────────────────────────────────┐
+                                            │  /verify-identity               │
+                                            │  Compare ID face vs Live face   │
+                                            └────────────┬────────────────────┘
+                                                         │
+                                                         │ Uses
+                                                         ▼
+                                            ┌─────────────────────────────────┐
+                                            │  FaceVerificationSystem         │
+                                            │  (ISF.py)  ★ INTEGRATED ★      │
+                                            │                                 │
+                                            │  • InsightFace/ArcFace          │
+                                            │  • Extract embeddings           │
+                                            │  • Calculate similarity         │
+                                            │  • Adaptive thresholding        │
+                                            │  • Quality assessment           │
+                                            └────────────┬────────────────────┘
+                                                         │
+                                                         │ Returns
+                                                         ▼
+                                            ┌─────────────────────────────────┐
+                                            │  Verification Result            │
+                                            │                                 │
+                                            │  {                              │
+                                            │    "verified": true,            │
+                                            │    "similarity": 0.72,          │
+                                            │    "confidence": "high"         │
+                                            │  }                              │
+                                            └─────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+COMPLETE WORKFLOW:
+
+1️⃣  UPLOAD ID
+    │
+    ├─ User uploads government-issued ID photo
+    │
+    ├─ IDFaceExtractor processes image
+    │   • Detects face in document
+    │   • Crops face region
+    │   • Saves to Extracted_Faces/face_TIMESTAMP.jpg
+    │
+    └─ Frontend receives face URL
+        Status: ✅ Ready for liveness check
+
+2️⃣  LIVENESS DETECTION
+    │
+    ├─ User activates webcam
+    │
+    ├─ Continuous frame capture (1 fps)
+    │
+    ├─ Each frame sent to AntiSpoofingEngine
+    │   • MiniFASNet V1SE model check
+    │   • MiniFASNet V2 model check
+    │   • Aggregate scores
+    │   • Determine if real or spoof
+    │
+    └─ Loop until: is_live = true
+        Status: ✅ Liveness confirmed
+
+3️⃣  FACE VERIFICATION ★ ISF.py INTEGRATION ★
+    │
+    ├─ Live capture + ID face sent to /verify-identity
+    │
+    ├─ FaceVerificationSystem.verify() called
+    │   │
+    │   ├─ Load ID face: extract_face_embedding(id_photo_path)
+    │   │   • Assess image quality
+    │   │   • Apply preprocessing (if needed)
+    │   │   • Extract 512-D ArcFace embedding
+    │   │
+    │   ├─ Load live face: extract_face_embedding(live_photo_path)
+    │   │   • No preprocessing (preserve authenticity)
+    │   │   • Extract 512-D ArcFace embedding
+    │   │
+    │   ├─ Calculate similarity: cosine_similarity(emb1, emb2)
+    │   │
+    │   ├─ Adaptive thresholding based on ID quality:
+    │   │   • Quality < 40: threshold = 0.40 (lenient)
+    │   │   • Quality < 60: threshold = 0.60 (moderate)
+    │   │   • Quality ≥ 60: threshold = 0.70 (standard)
+    │   │
+    │   └─ Determine match: similarity > threshold
+    │
+    └─ Return comprehensive result
+        Status: ✅ Verification complete
+
+═══════════════════════════════════════════════════════════════════════════════
+
+BACKEND INTEGRATION POINTS:
+
+File: backend/app.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Line 17:  from ISF import FaceVerificationSystem ✅
+
+Lines 45-70:  Initialization at startup ✅
+    face_verifier = FaceVerificationSystem(
+        model_name='buffalo_l',
+        use_gpu=False,
+        det_size=(640, 640)
+    )
+
+Lines 201-282:  /verify-identity endpoint ✅
+    @app.post("/verify-identity")
+    async def verify_identity(...):
+        verification_result = face_verifier.verify(
+            id_photo_path=str(id_file_path),
+            live_photo_path=str(live_temp_path)
+        )
+
+Lines 284-360:  /complete-verification endpoint ✅
+    @app.post("/complete-verification")
+    async def complete_verification(...):
+        # Step 1: Extract from ID
+        # Step 2: Check liveness
+        # Step 3: Verify with face_verifier.verify() ★
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FRONTEND INTEGRATION:
+
+File: frontend/src/App.jsx
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Function: performLivenessAndVerification()
+    
+    // Step 1: Check liveness
+    const livenessResponse = await fetch('/liveness-check', {...});
+    const livenessData = await livenessResponse.json();
+    
+    if (livenessData.is_live) {
+        
+        // Step 2: Verify identity using ISF.py ★
+        const verifyResponse = await fetch('/verify-identity', {
+            method: 'POST',
+            body: verifyFormData  // live_image + id_face_path
+        });
+        
+        const verifyData = await verifyResponse.json();
+        setVerificationResult(verifyData);
+    }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+═══════════════════════════════════════════════════════════════════════════════
+
+DATA FLOW:
+
+ID Photo          Live Capture
+   │                   │
+   │ ┌─────────────────┘
+   │ │
+   ▼ ▼
+┌──────────────────────────────┐
+│  FaceVerificationSystem      │
+│                              │
+│  verify(id_path, live_path)  │
+└───────────┬──────────────────┘
+            │
+            ├─ Extract embeddings
+            │  • ID:   [512 floats]
+            │  • Live: [512 floats]
+            │
+            ├─ Normalize vectors
+            │  • L2 normalization
+            │
+            ├─ Calculate similarity
+            │  • similarity = dot(norm_emb1, norm_emb2)
+            │  • Range: -1.0 to 1.0
+            │  • Typical match: 0.6 - 0.9
+            │
+            ├─ Apply threshold
+            │  • Adaptive based on quality
+            │
+            └─ Return result
+               {
+                 "match": true/false,
+                 "similarity": 0.72,
+                 "threshold": 0.70,
+                 "confidence": "high"
+               }
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SUMMARY:
+
+✅ FaceVerificationSystem (ISF.py) is FULLY INTEGRATED
+
+✅ Used after liveness detection confirms real person
+
+✅ Provides accurate face matching with ArcFace embeddings
+
+✅ Adaptive thresholding based on image quality
+
+✅ Complete end-to-end verification workflow operational
+
+═══════════════════════════════════════════════════════════════════════════════
+```

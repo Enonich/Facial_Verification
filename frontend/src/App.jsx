@@ -21,11 +21,20 @@ function App() {
   const [currentStep, setCurrentStep] = useState(1);
   const [statusMessage, setStatusMessage] = useState('');
 
+  // Store stream reference for cleanup
+  const streamRef = useRef(null);
+
   // Start webcam
   const startCamera = async () => {
     try {
       setIdMessage('📹 Starting camera...');
+      setStatusMessage('📹 Starting camera...');
       console.log('Requesting camera access...');
+      
+      // Stop any existing stream first
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
       
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { 
@@ -36,35 +45,56 @@ function App() {
       });
       
       console.log('Camera stream obtained:', stream);
+      streamRef.current = stream;
+      
+      // Set camera active first so the video element renders
+      setCameraActive(true);
+      
+      // Use a small delay to ensure the video element is mounted
+      await new Promise(resolve => setTimeout(resolve, 100));
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         
-        // Wait for video to be ready
-        videoRef.current.onloadedmetadata = () => {
+        // Wait for video to be ready and play
+        videoRef.current.onloadedmetadata = async () => {
           console.log('Video metadata loaded');
-          setCameraActive(true);
-          setIdMessage('✓ Camera active - Click "Capture ID Photo" when ready');
+          try {
+            await videoRef.current.play();
+            console.log('Video playing');
+            setIdMessage('✓ Camera active - Click "Capture ID Photo" when ready');
+            setStatusMessage('✓ Camera active - Position your face in frame');
+          } catch (playErr) {
+            console.error('Error playing video:', playErr);
+          }
         };
+      } else {
+        console.error('Video ref not available after delay');
+        setIdMessage('✗ Camera initialization failed. Please try again.');
+        setStatusMessage('✗ Camera initialization failed. Please try again.');
       }
     } catch (err) {
       const errorMsg = err.name === 'NotAllowedError' 
         ? 'Camera permission denied. Please allow camera access.' 
         : `Camera error: ${err.message}`;
       setIdMessage(`✗ ${errorMsg}`);
+      setStatusMessage(`✗ ${errorMsg}`);
       console.error('Error accessing camera:', err);
+      setCameraActive(false);
     }
   };
 
   // Stop webcam
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = videoRef.current.srcObject.getTracks();
-      tracks.forEach(track => track.stop());
-      videoRef.current.srcObject = null;
-      setCameraActive(false);
-      console.log('Camera stopped');
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraActive(false);
+    console.log('Camera stopped');
   };
 
   // Handle ID upload
@@ -92,10 +122,16 @@ function App() {
         setIdMessage('✓ Face extracted successfully from ID');
         setCurrentStep(2);
       } else {
-        setIdMessage(`✗ ${data.message}`);
+        // Show detailed error message for ID extraction failure
+        let errorMsg = data.message || 'Failed to extract face from ID';
+        if (data.recommendation) {
+          errorMsg += ` | 💡 ${data.recommendation}`;
+        }
+        setIdMessage(`✗ ${errorMsg}`);
+        console.log('ID extraction failed:', data);
       }
     } catch (err) {
-      setIdMessage(`Connection error: ${err.message}`);
+      setIdMessage(`✗ Connection error: ${err.message}. Please ensure the backend server is running.`);
       console.error('ID processing error:', err);
     } finally {
       setIdProcessing(false);
@@ -105,19 +141,23 @@ function App() {
   // Capture ID with camera
   const captureId = async () => {
     if (!canvasRef.current || !videoRef.current) {
-      console.error('Canvas or video ref not available');
+      console.error('Canvas or video ref not available', { canvas: canvasRef.current, video: videoRef.current });
+      setIdMessage('⚠ Camera not ready, please wait...');
       return;
     }
 
     const canvas = canvasRef.current;
     const video = videoRef.current;
 
-    // Wait for video to be ready
+    // Wait for video to be ready with retry
     if (video.videoWidth === 0 || video.videoHeight === 0) {
-      setIdMessage('⚠ Camera not ready, please wait...');
+      setIdMessage('⚠ Camera initializing, please wait...');
+      // Try again after a short delay
+      setTimeout(() => captureId(), 500);
       return;
     }
 
+    setIdMessage('📸 Capturing...');
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
@@ -147,10 +187,16 @@ function App() {
           setIdMessage('✓ Face extracted successfully from ID');
           setCurrentStep(2);
         } else {
-          setIdMessage(`✗ ${data.message}`);
+          // Show detailed error message for ID extraction failure
+          let errorMsg = data.message || 'Failed to extract face from ID';
+          if (data.recommendation) {
+            errorMsg += ` | 💡 ${data.recommendation}`;
+          }
+          setIdMessage(`✗ ${errorMsg}`);
+          console.log('ID capture extraction failed:', data);
         }
       } catch (err) {
-        setIdMessage(`Connection error: ${err.message}`);
+        setIdMessage(`✗ Connection error: ${err.message}. Please ensure the backend server is running.`);
         console.error('ID processing error:', err);
       } finally {
         setIdProcessing(false);
@@ -202,6 +248,7 @@ function App() {
 
           const verifyData = await verifyResponse.json();
           
+          // Enhance verification result with detailed info
           setVerificationResult(verifyData);
           setIsChecking(false);
           stopCamera();
@@ -209,16 +256,39 @@ function App() {
           if (verifyData.verified) {
             setStatusMessage('✓ Identity verified successfully!');
           } else {
-            setStatusMessage('✗ Identity verification failed');
+            // Show detailed failure reason
+            const reason = verifyData.failure_reason || verifyData.match_description || verifyData.message || 'Faces do not match';
+            setStatusMessage(`✗ Verification failed: ${reason}`);
           }
         } else {
-          setStatusMessage('⚠ Liveness check failed. Please try again.');
+          // Liveness failed - show detailed message
+          const livenessReason = livenessData.details || livenessData.message || 'Liveness check failed';
+          setStatusMessage(`⚠ ${livenessReason}`);
           setLivenessStatus('not-live');
+          setVerificationResult({
+            verified: false,
+            stage: 'liveness',
+            stageDescription: livenessData.stage_description || 'Liveness verification',
+            error_code: livenessData.error_code || 'LIVENESS_FAILED',
+            message: livenessData.message,
+            details: livenessData.details,
+            recommendation: livenessData.recommendation,
+            confidence: livenessData.confidence
+          });
         }
       } catch (err) {
         setStatusMessage(`Connection error: ${err.message}`);
         console.error('Verification error:', err);
         setIsChecking(false);
+        setVerificationResult({
+          verified: false,
+          stage: 'connection',
+          stageDescription: 'API Connection',
+          error_code: 'CONNECTION_ERROR',
+          message: 'Failed to connect to verification server',
+          details: err.message,
+          recommendation: 'Please check your internet connection and try again.'
+        });
       }
     }, 'image/jpeg', 0.95);
   }, [extractedFace]);
@@ -260,12 +330,23 @@ function App() {
     setStatusMessage('');
     stopCamera();
     setIsChecking(false);
+    setCameraActive(false);
+    setActiveView('upload-id');
   };
 
   // Cleanup camera on unmount
   useEffect(() => {
     return () => stopCamera();
   }, []);
+
+  // Re-attach stream when video element changes (e.g., view switch)
+  useEffect(() => {
+    if (cameraActive && streamRef.current && videoRef.current && !videoRef.current.srcObject) {
+      console.log('Re-attaching stream to video element');
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(err => console.error('Error playing video:', err));
+    }
+  }, [cameraActive, activeView]);
 
   return (
     <div className="app-container">
@@ -364,9 +445,10 @@ function App() {
                 )}
               </div>
 
-              {cameraActive && activeView === 'upload-id' && !extractedFace && (
+              {cameraActive && activeView === 'upload-id' && (
                 <div className="video-container" style={{ marginTop: '1.5rem' }}>
-                  <video ref={videoRef} autoPlay playsInline className="video-feed" />
+                  <video ref={videoRef} autoPlay muted playsInline className="video-feed" />
+                  <canvas ref={canvasRef} style={{ display: 'none' }} />
                 </div>
               )}
 
@@ -450,7 +532,7 @@ function App() {
                 <div className="video-container">
                   {cameraActive ? (
                     <>
-                      <video ref={videoRef} autoPlay playsInline className="video-feed" />
+                      <video ref={videoRef} autoPlay muted playsInline className="video-feed" />
                       {isChecking && (
                         <div style={{
                           position: 'absolute',
@@ -525,22 +607,116 @@ function App() {
                     {verificationResult.verified ? 'Identity Verified' : 'Verification Failed'}
                   </div>
                   
+                  {/* Show failure stage indicator (System Errors) */}
+                  {!verificationResult.verified && verificationResult.stage && (
+                    <div className="failure-stage" style={{
+                      background: 'rgba(239, 68, 68, 0.1)',
+                      border: '1px solid rgba(239, 68, 68, 0.3)',
+                      borderRadius: '8px',
+                      padding: '1rem',
+                      marginTop: '1rem',
+                      textAlign: 'left'
+                    }}>
+                      <div style={{ marginBottom: '0.5rem' }}>
+                        <strong style={{ color: 'var(--accent-red)' }}>Failed at: </strong>
+                        <span style={{ textTransform: 'capitalize' }}>
+                          {verificationResult.stageDescription || verificationResult.stage}
+                        </span>
+                      </div>
+                      {verificationResult.error_code && (
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
+                          Error Code: {verificationResult.error_code}
+                        </div>
+                      )}
+                      {(verificationResult.failure_reason || verificationResult.match_description || verificationResult.details) && (
+                        <div style={{ marginBottom: '0.5rem' }}>
+                          <strong>Reason: </strong>
+                          {verificationResult.failure_reason || verificationResult.match_description || verificationResult.details}
+                        </div>
+                      )}
+                      {verificationResult.recommendation && (
+                        <div style={{ 
+                          marginTop: '0.75rem', 
+                          padding: '0.75rem', 
+                          background: 'rgba(59, 130, 246, 0.1)', 
+                          borderRadius: '6px',
+                          fontSize: '0.875rem'
+                        }}>
+                          <strong>💡 Recommendation: </strong>
+                          {verificationResult.recommendation}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Show mismatch details (Verification Completed but Mismatch) */}
+                  {!verificationResult.verified && !verificationResult.error_code && !verificationResult.stage && (
+                    <div className="mismatch-details" style={{
+                      background: 'rgba(245, 158, 11, 0.1)', // Amber background
+                      border: '1px solid rgba(245, 158, 11, 0.3)',
+                      borderRadius: '8px',
+                      padding: '1rem',
+                      marginTop: '1rem',
+                      textAlign: 'left'
+                    }}>
+                       <div style={{ marginBottom: '0.5rem', color: 'var(--text-primary)' }}>
+                          <strong>Result: </strong>
+                          Identity Not Verified
+                       </div>
+
+                      {(verificationResult.non_match_reason || verificationResult.match_description || verificationResult.details) && (
+                        <div style={{ marginBottom: '0.5rem' }}>
+                          <strong>Reason: </strong>
+                          {verificationResult.non_match_reason || verificationResult.match_description || verificationResult.details}
+                        </div>
+                      )}
+                      {verificationResult.recommendation && (
+                        <div style={{ 
+                          marginTop: '0.75rem', 
+                          padding: '0.75rem', 
+                          background: 'rgba(59, 130, 246, 0.1)', 
+                          borderRadius: '6px',
+                          fontSize: '0.875rem'
+                        }}>
+                          <strong>💡 Recommendation: </strong>
+                          {verificationResult.recommendation}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  
                   <div className="result-details">
-                    {verificationResult.similarity && (
+                    {verificationResult.similarity !== undefined && verificationResult.similarity > 0 && (
                       <div className="result-detail-item">
                         <span>Similarity Score:</span>
                         <strong>{(verificationResult.similarity * 100).toFixed(2)}%</strong>
                       </div>
                     )}
-                    {verificationResult.confidence && (
+                    {verificationResult.threshold !== undefined && verificationResult.verified !== undefined && (
+                      <div className="result-detail-item">
+                        <span>Required Threshold:</span>
+                        <strong>{(verificationResult.threshold * 100).toFixed(2)}%</strong>
+                      </div>
+                    )}
+                    {verificationResult.confidence !== undefined && verificationResult.confidence > 0 && (
                       <div className="result-detail-item">
                         <span>Confidence:</span>
                         <strong>{(verificationResult.confidence * 100).toFixed(2)}%</strong>
                       </div>
                     )}
+                    {verificationResult.match_confidence && verificationResult.verified && (
+                      <div className="result-detail-item">
+                        <span>Match Quality:</span>
+                        <strong style={{ textTransform: 'capitalize' }}>
+                          {verificationResult.match_confidence.replace('_', ' ')}
+                        </strong>
+                      </div>
+                    )}
                     <div className="result-detail-item">
                       <span>Status:</span>
-                      <strong>{verificationResult.verified ? 'PASSED' : 'FAILED'}</strong>
+                      <strong style={{ color: verificationResult.verified ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                        {verificationResult.verified ? 'PASSED' : 'FAILED'}
+                      </strong>
                     </div>
                   </div>
 

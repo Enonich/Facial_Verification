@@ -45,42 +45,159 @@ class FaceVerificationSystem:
         print(f"  Providers: {providers}")
         print(f"  Detection size: {det_size}")
     
-    def assess_image_quality(self, img: np.ndarray) -> Dict:
+    def assess_face_quality(self, img: np.ndarray, face) -> Dict:
         """
-        Assess image quality using multiple metrics
+        Assess face quality using face-aware metrics (computed on face crop only)
         
         Args:
-            img: Input image (BGR format)
+            img: Full input image (BGR format)
+            face: Detected face object from InsightFace
             
         Returns:
-            Dictionary with quality metrics
+            Dictionary with face-aware quality metrics
         """
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = img.shape[:2]
+        image_area = h * w
         
-        # Calculate blur score (Laplacian variance)
-        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        # Extract face bounding box
+        x1, y1, x2, y2 = map(int, face.bbox)
+        # Clamp to image boundaries
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
         
-        # Calculate brightness
-        brightness = np.mean(gray)
+        # Extract face crop for quality assessment
+        face_crop = img[y1:y2, x1:x2]
+        if face_crop.size == 0:
+            return self._default_quality_metrics()
         
-        # Calculate contrast
-        contrast = gray.std()
+        face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        face_h, face_w = face_crop.shape[:2]
+        face_area = face_h * face_w
         
-        # Overall quality score (0-100)
-        quality_score = min(100, (
-            (min(blur_score, 500) / 5) * 0.4 +  # Blur weight: 40%
-            (min(contrast, 100)) * 0.3 +         # Contrast weight: 30%
-            (abs(brightness - 128) / 128 * 100) * 0.3  # Brightness weight: 30%
-        ))
+        # === Face-Aware Metrics ===
+        
+        # 1. Detection confidence (strong proxy for usability)
+        det_score = float(face.det_score)
+        
+        # 2. Face size ratio (small faces = weak embeddings)
+        face_size_ratio = face_area / image_area
+        # Normalize: 0.01 (1%) is minimum usable, 0.25 (25%) is excellent
+        face_size_score = min(1.0, max(0.0, (face_size_ratio - 0.01) / 0.24))
+        
+        # 3. Inter-ocular distance (proxy for face resolution)
+        landmarks = face.kps  # 5-point landmarks: [left_eye, right_eye, nose, left_mouth, right_mouth]
+        left_eye = landmarks[0]
+        right_eye = landmarks[1]
+        inter_ocular_dist = np.linalg.norm(np.array(left_eye) - np.array(right_eye))
+        # Normalize: 20px is minimum, 80px+ is excellent
+        iod_score = min(1.0, max(0.0, (inter_ocular_dist - 20) / 60))
+        
+        # 4. Blur score on face region only (Laplacian variance)
+        blur_score = cv2.Laplacian(face_gray, cv2.CV_64F).var()
+        # Calibrated for ID photos: 30-80 is common, 100+ is good
+        # Use log scale for better distribution
+        blur_normalized = min(1.0, max(0.0, np.log1p(blur_score) / np.log1p(300)))
+        
+        # 5. Face brightness (on face crop only)
+        brightness = np.mean(face_gray)
+        # FIXED: Penalize deviation from ideal (was rewarding bad brightness)
+        brightness_score = 1.0 - abs(brightness - 128) / 128
+        brightness_score = max(0.0, brightness_score)
+        
+        # 6. Face contrast (on face crop only)
+        contrast = face_gray.std()
+        contrast_score = min(1.0, contrast / 60)  # 60+ std dev is good contrast
+        
+        # 7. Pose estimation (if available via landmarks)
+        pose_score = self._estimate_pose_score(landmarks, face_w)
+        
+        # === Combined Quality Score ===
+        # Weighted by importance for verification reliability
+        quality_score = (
+            0.30 * det_score +           # Detection confidence (most reliable)
+            0.20 * face_size_score +     # Face size ratio
+            0.15 * iod_score +           # Inter-ocular distance
+            0.15 * blur_normalized +     # Sharpness
+            0.10 * brightness_score +    # Brightness
+            0.05 * contrast_score +      # Contrast
+            0.05 * pose_score            # Frontal pose
+        ) * 100
+        
+        # Conservative enhancement trigger:
+        # Only enhance if face is very small OR detection confidence is borderline
+        needs_enhancement = (
+            (det_score < 0.7 and blur_normalized < 0.3) or
+            (face_size_ratio < 0.02 and blur_normalized < 0.4)
+        )
         
         return {
-            'blur_score': float(blur_score),
-            'brightness': float(brightness),
-            'contrast': float(contrast),
-            'resolution': (w, h),
             'quality_score': float(quality_score),
-            'needs_enhancement': blur_score < 100 or contrast < 30
+            'det_score': det_score,
+            'face_size_ratio': float(face_size_ratio),
+            'face_size_score': float(face_size_score),
+            'inter_ocular_distance': float(inter_ocular_dist),
+            'iod_score': float(iod_score),
+            'blur_score': float(blur_score),
+            'blur_normalized': float(blur_normalized),
+            'brightness': float(brightness),
+            'brightness_score': float(brightness_score),
+            'contrast': float(contrast),
+            'contrast_score': float(contrast_score),
+            'pose_score': float(pose_score),
+            'resolution': (w, h),
+            'face_resolution': (face_w, face_h),
+            'needs_enhancement': needs_enhancement
+        }
+    
+    def _estimate_pose_score(self, landmarks: np.ndarray, face_width: int) -> float:
+        """
+        Estimate how frontal the face is based on landmark symmetry
+        
+        Args:
+            landmarks: 5-point facial landmarks
+            face_width: Width of face bounding box
+            
+        Returns:
+            Pose score (0-1, higher = more frontal)
+        """
+        if landmarks is None or len(landmarks) < 5:
+            return 0.5  # Unknown
+        
+        left_eye = landmarks[0]
+        right_eye = landmarks[1]
+        nose = landmarks[2]
+        
+        # Calculate horizontal offset of nose from eye midpoint
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2
+        nose_offset = abs(nose[0] - eye_center_x)
+        
+        # Normalize by face width (0 = perfect frontal, 0.5 = extreme profile)
+        offset_ratio = nose_offset / max(face_width, 1)
+        
+        # Convert to score (1 = frontal, 0 = profile)
+        pose_score = max(0.0, 1.0 - (offset_ratio * 4))  # 25% offset = 0 score
+        
+        return pose_score
+    
+    def _default_quality_metrics(self) -> Dict:
+        """Return default quality metrics when face crop is invalid"""
+        return {
+            'quality_score': 0.0,
+            'det_score': 0.0,
+            'face_size_ratio': 0.0,
+            'face_size_score': 0.0,
+            'inter_ocular_distance': 0.0,
+            'iod_score': 0.0,
+            'blur_score': 0.0,
+            'blur_normalized': 0.0,
+            'brightness': 0.0,
+            'brightness_score': 0.0,
+            'contrast': 0.0,
+            'contrast_score': 0.0,
+            'pose_score': 0.0,
+            'resolution': (0, 0),
+            'face_resolution': (0, 0),
+            'needs_enhancement': False
         }
     
     def safe_preprocess(self, img: np.ndarray) -> np.ndarray:
@@ -133,17 +250,10 @@ class FaceVerificationSystem:
         if img is None:
             return {'error': f'Failed to load image: {img_path}'}
         
-        # Assess quality
-        quality = self.assess_image_quality(img)
+        # Store original for quality assessment
+        img_original = img.copy()
         
-        # Apply preprocessing if needed and requested
-        if preprocess and quality['needs_enhancement']:
-            img = self.safe_preprocess(img)
-            preprocessed = True
-        else:
-            preprocessed = False
-        
-        # Detect faces
+        # Detect faces FIRST (quality is computed on face crop)
         faces = self.app.get(img)
         
         if not faces:
@@ -154,6 +264,21 @@ class FaceVerificationSystem:
             faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
         
         face = faces[0]
+        
+        # Assess quality on FACE CROP only (not full image)
+        quality = self.assess_face_quality(img_original, face)
+        
+        # Apply preprocessing only if conservative threshold met
+        preprocessed = False
+        if preprocess and quality['needs_enhancement']:
+            img = self.safe_preprocess(img)
+            # Re-detect face after preprocessing
+            faces_pp = self.app.get(img)
+            if faces_pp:
+                if len(faces_pp) > 1:
+                    faces_pp = sorted(faces_pp, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
+                face = faces_pp[0]
+                preprocessed = True
         
         return {
             'embedding': face.embedding,
@@ -190,7 +315,8 @@ class FaceVerificationSystem:
     def verify(self, 
                id_photo_path: str, 
                live_photo_path: str,
-               adaptive_threshold: bool = True) -> Dict:
+               adaptive_threshold: bool = True,
+               verbose: bool = True) -> Dict:
         """
         Verify if two faces match
         
@@ -198,6 +324,7 @@ class FaceVerificationSystem:
             id_photo_path: Path to ID photo
             live_photo_path: Path to live/selfie photo
             adaptive_threshold: Use quality-based adaptive thresholding
+            verbose: Print quality scores during verification
             
         Returns:
             Verification result with match status and metadata
@@ -214,6 +341,38 @@ class FaceVerificationSystem:
         if 'error' in live_result:
             return {'success': False, 'error': live_result['error']}
         
+        # Print quality scores if verbose
+        if verbose:
+            print("\n" + "="*50)
+            print("📊 IMAGE QUALITY SCORES")
+            print("="*50)
+            
+            # ID Photo Quality (Face-Aware Metrics)
+            id_q = id_result['quality']
+            print(f"\n🪪  ID Photo Quality (Face-Aware):")
+            print(f"    • Overall Score: {id_q['quality_score']:.1f}/100")
+            print(f"    • Detection Confidence: {id_q['det_score']:.3f} {'✓' if id_q['det_score'] >= 0.8 else '⚠'}")
+            print(f"    • Face Size: {id_q['face_size_ratio']*100:.1f}% of image {'✓' if id_q['face_size_ratio'] >= 0.05 else '⚠ (small)'}")
+            print(f"    • Inter-Ocular Dist: {id_q['inter_ocular_distance']:.1f}px {'✓' if id_q['inter_ocular_distance'] >= 40 else '⚠ (low res)'}")
+            print(f"    • Face Sharpness: {id_q['blur_normalized']*100:.0f}% {'✓' if id_q['blur_normalized'] >= 0.3 else '⚠ (blurry)'}")
+            print(f"    • Brightness Score: {id_q['brightness_score']*100:.0f}% {'✓' if id_q['brightness_score'] >= 0.5 else '⚠'}")
+            print(f"    • Pose Score: {id_q['pose_score']*100:.0f}% {'✓' if id_q['pose_score'] >= 0.7 else '⚠ (angled)'}")
+            print(f"    • Face Resolution: {id_q['face_resolution'][0]}x{id_q['face_resolution'][1]}")
+            print(f"    • Preprocessed: {'Yes' if id_result['preprocessed'] else 'No'}")
+            
+            # Live Photo Quality (Face-Aware Metrics)
+            live_q = live_result['quality']
+            print(f"\n📸 Live Photo Quality (Face-Aware):")
+            print(f"    • Overall Score: {live_q['quality_score']:.1f}/100")
+            print(f"    • Detection Confidence: {live_q['det_score']:.3f} {'✓' if live_q['det_score'] >= 0.8 else '⚠'}")
+            print(f"    • Face Size: {live_q['face_size_ratio']*100:.1f}% of image {'✓' if live_q['face_size_ratio'] >= 0.05 else '⚠ (small)'}")
+            print(f"    • Inter-Ocular Dist: {live_q['inter_ocular_distance']:.1f}px {'✓' if live_q['inter_ocular_distance'] >= 40 else '⚠ (low res)'}")
+            print(f"    • Face Sharpness: {live_q['blur_normalized']*100:.0f}% {'✓' if live_q['blur_normalized'] >= 0.3 else '⚠ (blurry)'}")
+            print(f"    • Brightness Score: {live_q['brightness_score']*100:.0f}% {'✓' if live_q['brightness_score'] >= 0.5 else '⚠'}")
+            print(f"    • Pose Score: {live_q['pose_score']*100:.0f}% {'✓' if live_q['pose_score'] >= 0.7 else '⚠ (angled)'}")
+            print(f"    • Face Resolution: {live_q['face_resolution'][0]}x{live_q['face_resolution'][1]}")
+            print("="*50)
+        
         # Calculate similarity
         similarity = self.calculate_similarity(
             id_result['embedding'], 
@@ -221,19 +380,33 @@ class FaceVerificationSystem:
         )
         
         # Determine threshold based on ID quality
+        # SECURITY: Threshold is BOUNDED to prevent fraud amplification
         if adaptive_threshold:
             id_quality = id_result['quality']['quality_score']
-            if id_quality < 40:
-                threshold = 0.4  # Very lenient for poor quality
-                confidence_level = 'low'
-            elif id_quality < 60:
-                threshold = 0.60  # Moderate
+            base_threshold = 0.55  # Base threshold for verification
+            
+            # Quality-based adjustment (bounded)
+            # Lower quality = HIGHER threshold (more strict, not more lenient)
+            # This prevents poor quality from enabling fraud
+            quality_normalized = id_quality / 100.0  # 0-1 scale
+            
+            # Small adjustment based on quality (max ±0.10)
+            # High quality (1.0) -> -0.05 (slightly easier)
+            # Low quality (0.0) -> +0.05 (slightly harder)
+            adjustment = (0.5 - quality_normalized) * 0.10
+            
+            threshold = base_threshold + adjustment
+            # HARD BOUNDS: Never go below 0.50 or above 0.65
+            threshold = max(0.50, min(0.65, threshold))
+            
+            if quality_normalized >= 0.7:
+                confidence_level = 'high'
+            elif quality_normalized >= 0.5:
                 confidence_level = 'medium'
             else:
-                threshold = 0.7  # Standard
-                confidence_level = 'high'
+                confidence_level = 'low'
         else:
-            threshold = 0.7
+            threshold = 0.55
             confidence_level = 'standard'
         
         # Determine match
@@ -252,6 +425,16 @@ class FaceVerificationSystem:
         
         processing_time = (datetime.now() - start_time).total_seconds() * 1000
         
+        # Print verification result if verbose
+        if verbose:
+            print(f"\n🔐 VERIFICATION RESULT:")
+            print(f"    • Similarity: {similarity:.4f} ({similarity*100:.2f}%)")
+            print(f"    • Threshold: {threshold:.2f} ({threshold*100:.0f}%)")
+            print(f"    • Match: {'✅ YES' if is_match else '❌ NO'}")
+            print(f"    • Confidence: {match_confidence}")
+            print(f"    • Processing Time: {processing_time:.1f}ms")
+            print("="*50 + "\n")
+        
         return {
             'success': True,
             'match': is_match,
@@ -264,6 +447,110 @@ class FaceVerificationSystem:
             'processing_time_ms': processing_time,
             'details': {
                 'id_face_score': id_result['det_score'],
+                'live_face_score': live_result['det_score'],
+                'threshold_type': confidence_level
+            }
+        }
+
+    def verify_with_embedding(self, 
+                            id_embedding_path: str, 
+                            live_photo_path: str,
+                            adaptive_threshold: bool = True,
+                            verbose: bool = True) -> Dict:
+        """
+        Verify live photo against a pre-computed ID embedding
+        
+        Args:
+            id_embedding_path: Path to .npy file containing ID embedding
+            live_photo_path: Path to live/selfie photo
+            adaptive_threshold: Use quality-based adaptive thresholding
+            verbose: Print verification details
+            
+        Returns:
+            Verification result
+        """
+        start_time = datetime.now()
+        
+        # Load ID embedding
+        try:
+            id_embedding = np.load(id_embedding_path)
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to load ID embedding: {str(e)}'}
+            
+        # Extract live embedding
+        live_result = self.extract_face_embedding(live_photo_path, preprocess=False)
+        
+        if 'error' in live_result:
+            return {'success': False, 'error': live_result['error']}
+            
+        # Print quality scores if verbose
+        if verbose:
+            print("\n" + "="*50)
+            print("📊 IMAGE QUALITY SCORES (Embedding Mode)")
+            print("="*50)
+            
+            # Live Photo Quality (Face-Aware Metrics)
+            live_q = live_result['quality']
+            print(f"\n📸 Live Photo Quality (Face-Aware):")
+            print(f"    • Overall Score: {live_q['quality_score']:.1f}/100")
+            print(f"    • Detection Confidence: {live_q['det_score']:.3f} {'✓' if live_q['det_score'] >= 0.8 else '⚠'}")
+            print(f"    • Face Size: {live_q['face_size_ratio']*100:.1f}% of image {'✓' if live_q['face_size_ratio'] >= 0.05 else '⚠ (small)'}")
+            print(f"    • Inter-Ocular Dist: {live_q['inter_ocular_distance']:.1f}px {'✓' if live_q['inter_ocular_distance'] >= 40 else '⚠ (low res)'}")
+            print(f"    • Face Sharpness: {live_q['blur_normalized']*100:.0f}% {'✓' if live_q['blur_normalized'] >= 0.3 else '⚠ (blurry)'}")
+            print(f"    • Brightness Score: {live_q['brightness_score']*100:.0f}% {'✓' if live_q['brightness_score'] >= 0.5 else '⚠'}")
+            print(f"    • Pose Score: {live_q['pose_score']*100:.0f}% {'✓' if live_q['pose_score'] >= 0.7 else '⚠ (angled)'}")
+            print(f"    • Face Resolution: {live_q['face_resolution'][0]}x{live_q['face_resolution'][1]}")
+            print("="*50)
+
+        # Calculate similarity
+        similarity = self.calculate_similarity(
+            id_embedding, 
+            live_result['embedding']
+        )
+        
+        # Determine threshold
+        # Since we don't have ID quality metrics when loading from embedding,
+        # we'll use a standard safe threshold or slightly conservative one.
+        threshold = 0.55
+        confidence_level = 'standard'
+        
+        # Determine match
+        is_match = similarity > threshold
+        
+        # Calculate confidence
+        if is_match:
+            if similarity > threshold + 0.15:
+                match_confidence = 'very_high'
+            elif similarity > threshold + 0.10:
+                match_confidence = 'high'
+            else:
+                match_confidence = 'medium'
+        else:
+            match_confidence = 'no_match'
+            
+        processing_time = (datetime.now() - start_time).total_seconds() * 1000
+        
+        if verbose:
+            print(f"\n🔐 VERIFICATION RESULT:")
+            print(f"    • Similarity: {similarity:.4f} ({similarity*100:.2f}%)")
+            print(f"    • Threshold: {threshold:.2f} ({threshold*100:.0f}%)")
+            print(f"    • Match: {'✅ YES' if is_match else '❌ NO'}")
+            print(f"    • Confidence: {match_confidence}")
+            print(f"    • Processing Time: {processing_time:.1f}ms")
+            print("="*50 + "\n")
+        
+        return {
+            'success': True,
+            'match': is_match,
+            'similarity': similarity,
+            'similarity_percentage': similarity * 100,
+            'threshold': threshold,
+            'threshold_percentage': threshold * 100,
+            'match_confidence': match_confidence,
+            'match_description': 'Faces match' if is_match else 'Faces do not match',
+            'live_quality': live_result['quality'],
+            'processing_time_ms': processing_time,
+            'details': {
                 'live_face_score': live_result['det_score'],
                 'threshold_type': confidence_level
             }
@@ -304,7 +591,7 @@ class FaceVerificationSystem:
             results.append({
                 'path': live_path,
                 'similarity': similarity,
-                'match': similarity > 0.35
+                'match': similarity > 0.50  # Use bounded minimum threshold
             })
         
         return results

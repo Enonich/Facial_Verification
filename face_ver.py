@@ -8,8 +8,8 @@ verifier = FaceVerificationSystem(
 
 # Verify faces
 result = verifier.verify(
-    id_photo_path='photos/franka.jpeg',
-    live_photo_path='photos/Franka2.jpeg'
+    id_photo_path='photos/ransford.jpeg',
+    live_photo_path='photos/rans2.jpeg'
 )
 
 # Check result

@@ -1,0 +1,14 @@
+fastapi
+pydantic
+pydantic-core
+uvicorn
+python-multipart
+opencv-python
+numpy
+insightface
+onnxruntime-gpu
+onnxruntime
+pillow
+torch
+torchvision
+easydict

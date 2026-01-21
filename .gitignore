@@ -32,6 +32,7 @@ resources/detection_model/
 # Extracted/Generated content
 Extracted_Faces/
 saved_logs/
+uploads/
 
 # IDEs
 .vscode/

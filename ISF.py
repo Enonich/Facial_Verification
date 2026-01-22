@@ -45,6 +45,42 @@ class FaceVerificationSystem:
         print(f"  Providers: {providers}")
         print(f"  Detection size: {det_size}")
     
+    def _validate_single_face(self, faces) -> Tuple[bool, Optional[str], Optional[object]]:
+        """
+        🔐 SECURITY: Enforce EXACTLY ONE face. Zero tolerance for multiple faces.
+        Prevents photo-holding attacks and multi-person scenarios.
+        
+        Args:
+            faces: List of detected faces
+            
+        Returns:
+            Tuple of (is_valid, error_message, face_object)
+        """
+        if not faces:
+            return False, "No face detected", None
+
+        if len(faces) == 1:
+            return True, None, faces[0]
+
+        # --- STRICT REJECTION: Multiple faces detected ---
+        return (
+            False,
+            f"Security violation: {len(faces)} faces detected. Only single-person verification allowed.",
+            None
+        )
+    
+    def _sanitize(self, obj):
+        """Recursively convert numpy types to Python native types for JSON serialization"""
+        if isinstance(obj, np.generic):
+            return obj.item()
+        elif isinstance(obj, dict):
+            return {k: self._sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._sanitize(v) for v in obj]
+        elif isinstance(obj, set):
+            return [self._sanitize(v) for v in list(obj)]
+        return obj
+
     def assess_face_quality(self, img: np.ndarray, face) -> Dict:
         """
         Assess face quality using face-aware metrics (computed on face crop only)
@@ -125,14 +161,14 @@ class FaceVerificationSystem:
         
         # Conservative enhancement trigger:
         # Only enhance if face is very small OR detection confidence is borderline
-        needs_enhancement = (
+        needs_enhancement = bool(
             (det_score < 0.7 and blur_normalized < 0.3) or
             (face_size_ratio < 0.02 and blur_normalized < 0.4)
         )
         
         return {
             'quality_score': float(quality_score),
-            'det_score': det_score,
+            'det_score': float(det_score),
             'face_size_ratio': float(face_size_ratio),
             'face_size_score': float(face_size_score),
             'inter_ocular_distance': float(inter_ocular_dist),
@@ -144,8 +180,8 @@ class FaceVerificationSystem:
             'contrast': float(contrast),
             'contrast_score': float(contrast_score),
             'pose_score': float(pose_score),
-            'resolution': (w, h),
-            'face_resolution': (face_w, face_h),
+            'resolution': (int(w), int(h)),
+            'face_resolution': (int(face_w), int(face_h)),
             'needs_enhancement': needs_enhancement
         }
     
@@ -256,14 +292,10 @@ class FaceVerificationSystem:
         # Detect faces FIRST (quality is computed on face crop)
         faces = self.app.get(img)
         
-        if not faces:
-            return {'error': 'No face detected in image'}
-        
-        if len(faces) > 1:
-            # Multiple faces - use the largest one
-            faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
-        
-        face = faces[0]
+        # 🔐 SECURITY: Strict single-face validation
+        valid, error, face = self._validate_single_face(faces)
+        if not valid:
+            return {'error': error}
         
         # Assess quality on FACE CROP only (not full image)
         quality = self.assess_face_quality(img_original, face)
@@ -274,18 +306,19 @@ class FaceVerificationSystem:
             img = self.safe_preprocess(img)
             # Re-detect face after preprocessing
             faces_pp = self.app.get(img)
-            if faces_pp:
-                if len(faces_pp) > 1:
-                    faces_pp = sorted(faces_pp, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
-                face = faces_pp[0]
+            # 🔐 SECURITY: Re-validate after preprocessing
+            valid_pp, error_pp, face_pp = self._validate_single_face(faces_pp)
+            if valid_pp:
+                face = face_pp
                 preprocessed = True
+            # If preprocessing broke single-face constraint, keep original
         
         return {
             'embedding': face.embedding,
             'bbox': face.bbox.tolist(),
             'landmark': face.kps.tolist(),
             'det_score': float(face.det_score),
-            'quality': quality,
+            'quality': self._sanitize(quality),
             'preprocessed': preprocessed,
             'embedding_norm': float(np.linalg.norm(face.embedding))
         }
@@ -456,7 +489,8 @@ class FaceVerificationSystem:
                             id_embedding_path: str, 
                             live_photo_path: str,
                             adaptive_threshold: bool = True,
-                            verbose: bool = True) -> Dict:
+                            verbose: bool = True,
+                            id_quality_metrics: Optional[Dict] = None) -> Dict:
         """
         Verify live photo against a pre-computed ID embedding
         
@@ -465,6 +499,7 @@ class FaceVerificationSystem:
             live_photo_path: Path to live/selfie photo
             adaptive_threshold: Use quality-based adaptive thresholding
             verbose: Print verification details
+            id_quality_metrics: Optional dictionary with ID quality scores (for logging/thresholding)
             
         Returns:
             Verification result
@@ -489,6 +524,18 @@ class FaceVerificationSystem:
             print("📊 IMAGE QUALITY SCORES (Embedding Mode)")
             print("="*50)
             
+            # ID Photo Quality (if provided)
+            if id_quality_metrics:
+                id_q = id_quality_metrics
+                print(f"\n🪪  ID Photo Quality (From Pre-computation):")
+                print(f"    • Overall Score: {id_q.get('quality_score', 0):.1f}/100")
+                print(f"    • Detection Confidence: {id_q.get('det_score', 0):.3f} {'✓' if id_q.get('det_score', 0) >= 0.8 else '⚠'}")
+                print(f"    • Face Size: {id_q.get('face_size_ratio', 0)*100:.1f}% of image {'✓' if id_q.get('face_size_ratio', 0) >= 0.05 else '⚠ (small)'}")
+                print(f"    • Inter-Ocular Dist: {id_q.get('inter_ocular_distance', 0):.1f}px {'✓' if id_q.get('inter_ocular_distance', 0) >= 40 else '⚠ (low res)'}")
+                print(f"    • Face Sharpness: {id_q.get('blur_normalized', 0)*100:.0f}% {'✓' if id_q.get('blur_normalized', 0) >= 0.3 else '⚠ (blurry)'}")
+                print(f"    • Brightness Score: {id_q.get('brightness_score', 0)*100:.0f}% {'✓' if id_q.get('brightness_score', 0) >= 0.5 else '⚠'}")
+                print(f"    • Pose Score: {id_q.get('pose_score', 0)*100:.0f}% {'✓' if id_q.get('pose_score', 0) >= 0.7 else '⚠ (angled)'}")
+                
             # Live Photo Quality (Face-Aware Metrics)
             live_q = live_result['quality']
             print(f"\n📸 Live Photo Quality (Face-Aware):")
@@ -499,7 +546,6 @@ class FaceVerificationSystem:
             print(f"    • Face Sharpness: {live_q['blur_normalized']*100:.0f}% {'✓' if live_q['blur_normalized'] >= 0.3 else '⚠ (blurry)'}")
             print(f"    • Brightness Score: {live_q['brightness_score']*100:.0f}% {'✓' if live_q['brightness_score'] >= 0.5 else '⚠'}")
             print(f"    • Pose Score: {live_q['pose_score']*100:.0f}% {'✓' if live_q['pose_score'] >= 0.7 else '⚠ (angled)'}")
-            print(f"    • Face Resolution: {live_q['face_resolution'][0]}x{live_q['face_resolution'][1]}")
             print("="*50)
 
         # Calculate similarity
@@ -509,10 +555,28 @@ class FaceVerificationSystem:
         )
         
         # Determine threshold
-        # Since we don't have ID quality metrics when loading from embedding,
-        # we'll use a standard safe threshold or slightly conservative one.
-        threshold = 0.55
-        confidence_level = 'standard'
+        if adaptive_threshold and id_quality_metrics:
+            try:
+                id_quality = id_quality_metrics.get('quality_score', 50.0)
+                base_threshold = 0.55
+                
+                # Quality-based adjustment (bounded)
+                quality_normalized = id_quality / 100.0  # 0-1 scale
+                
+                # Small adjustment based on quality (max ±0.10)
+                adjustment = (0.5 - quality_normalized) * 0.10
+                
+                threshold = base_threshold + adjustment
+                # HARD BOUNDS: Never go below 0.50 or above 0.65
+                threshold = max(0.50, min(0.65, threshold))
+                confidence_level = 'quality-adjusted'
+            except:
+                threshold = 0.55
+                confidence_level = 'standard'
+        else:
+            # Fall back to standard threshold if no ID quality available
+            threshold = 0.55
+            confidence_level = 'standard'
         
         # Determine match
         is_match = similarity > threshold
@@ -549,6 +613,7 @@ class FaceVerificationSystem:
             'match_confidence': match_confidence,
             'match_description': 'Faces match' if is_match else 'Faces do not match',
             'live_quality': live_result['quality'],
+            'id_quality': id_quality_metrics,
             'processing_time_ms': processing_time,
             'details': {
                 'live_face_score': live_result['det_score'],

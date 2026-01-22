@@ -45,9 +45,11 @@ class Detection:
             raise FileNotFoundError(f"Deploy prototxt not found: {deploy}")
         
         self.detector = cv2.dnn.readNetFromCaffe(deploy, caffemodel)
-        self.detector_confidence = 0.6
+        # Lower threshold to 0.5 to catch more faces including photos being held
+        self.detector_confidence = 0.5
 
     def get_bbox(self, img):
+        """Get bounding box of highest confidence face"""
         height, width = img.shape[0], img.shape[1]
         aspect_ratio = width / height
         if img.shape[1] * img.shape[0] >= 192 * 192:
@@ -63,6 +65,61 @@ class Detection:
                                    out[max_conf_index, 5]*width, out[max_conf_index, 6]*height
         bbox = [int(left), int(top), int(right-left+1), int(bottom-top+1)]
         return bbox
+    
+    def get_face_count(self, img):
+        """
+        Count number of faces detected above confidence threshold
+        
+        CRITICAL for security: This method MUST detect ALL faces in frame,
+        including photos being held next to live faces.
+        """
+        height, width = img.shape[0], img.shape[1]
+        aspect_ratio = width / height
+        
+        # Resize for detection
+        if img.shape[1] * img.shape[0] >= 192 * 192:
+            img_resized = cv2.resize(img,
+                             (int(192 * math.sqrt(aspect_ratio)),
+                              int(192 / math.sqrt(aspect_ratio))), interpolation=cv2.INTER_LINEAR)
+        else:
+            img_resized = img
+
+        blob = cv2.dnn.blobFromImage(img_resized, 1, mean=(104, 117, 123))
+        self.detector.setInput(blob, 'data')
+        out = self.detector.forward('detection_out').squeeze()
+        
+        # Debug: Print ALL detections to see what the detector finds
+        print(f"\n🔍 Face Detection Debug:")
+        print(f"   Image size: {width}x{height}")
+        print(f"   Detector output shape: {out.shape}")
+        
+        # Count faces above confidence threshold
+        # out shape: (N, 7) where each row is [image_id, label, confidence, x1, y1, x2, y2]
+        if out.ndim == 1:
+            # Only one detection (or weird shape)
+            if len(out) >= 3 and out[2] > self.detector_confidence:
+                face_count = 1
+                print(f"   Single detection with confidence: {out[2]:.3f}")
+            else:
+                face_count = 0
+                print(f"   No faces above threshold {self.detector_confidence}")
+        else:
+            # Multiple detections
+            above_threshold = out[:, 2] > self.detector_confidence
+            face_count = np.sum(above_threshold)
+            print(f"   Total detections: {len(out)}")
+            print(f"   Above threshold ({self.detector_confidence}): {face_count}")
+            if face_count > 0:
+                confidences = out[above_threshold, 2]
+                print(f"   Confidences: {confidences}")
+        
+        print(f"   Final face count: {face_count}")
+        
+        # Security alert for multiple faces
+        if face_count > 1:
+            print(f"   ⚠️  SECURITY ALERT: {face_count} faces detected in frame!")
+        
+        return int(face_count)
 
 
 class CustomAntiSpoofPredict:
@@ -74,6 +131,9 @@ class CustomAntiSpoofPredict:
 
     def get_bbox(self, img):
         return self.detector.get_bbox(img)
+    
+    def get_face_count(self, img):
+        return self.detector.get_face_count(img)
 
     def _load_model(self, model_path):
         # define model
@@ -167,26 +227,48 @@ class AntiSpoofingEngine:
         """
         Verify if the face in the frame is real or spoofed
         
+        SECURITY CRITICAL: This method enforces the correct verification order:
+        1. FIRST: Count faces - reject if != 1 (prevents photo-holding attacks)
+        2. SECOND: Check liveness on the single detected face
+        3. Face matching happens separately after this verification passes
+        
         Args:
             frame: OpenCV image (BGR format)
             
         Returns:
-            tuple: (is_live, message, confidence, bbox)
+            tuple: (is_live, message, confidence, bbox, face_count)
                 - is_live: True if real face, False if fake
                 - message: Descriptive message
                 - confidence: Confidence score (0.0-1.0)
                 - bbox: Face bounding box [x, y, w, h] or None
+                - face_count: Number of faces detected
         """
         try:
             if frame is None or frame.size == 0:
-                return False, "Invalid image", 0.0, None
+                return False, "Invalid image", 0.0, None, 0
             
-            # Get face bounding box
+            # SECURITY STEP 1: Count ALL faces in frame BEFORE doing anything else
+            # This prevents attacks where someone holds a photo next to their face:
+            # - The live person would pass liveness
+            # - But the photo could be matched for verification
+            # By counting first, we reject ANY frame with multiple faces
+            face_count = self.model.get_face_count(frame)
+            
+            if face_count == 0:
+                return False, "No face detected", 0.0, None, 0
+            
+            if face_count > 1:
+                # CRITICAL: Reject immediately if multiple faces detected
+                # This blocks photo-holding attacks
+                return False, f"Multiple faces detected ({face_count}). Please ensure only one person is in frame.", 0.0, None, face_count
+            
+            # SECURITY STEP 2: Get bounding box of the single confirmed face
             image_bbox = self.model.get_bbox(frame)
             
             if image_bbox is None:
-                return False, "No face detected", 0.0, None
+                return False, "No face detected", 0.0, None, face_count
             
+            # SECURITY STEP 3: Check liveness ONLY on the single detected face
             # Initialize prediction array
             prediction = np.zeros((1, 3))
             
@@ -232,10 +314,10 @@ class AntiSpoofingEngine:
             else:
                 message = f"❌ Fake Face Detected (confidence: {confidence:.2f})"
             
-            return is_live, message, confidence, image_bbox
+            return is_live, message, confidence, image_bbox, face_count
             
         except Exception as e:
-            return False, f"Error during verification: {str(e)}", 0.0, None
+            return False, f"Error during verification: {str(e)}", 0.0, None, 0
     
     def verify_with_visualization(self, frame):
         """
@@ -245,14 +327,34 @@ class AntiSpoofingEngine:
             frame: OpenCV image (BGR format)
             
         Returns:
-            tuple: (is_live, message, confidence, annotated_frame)
+            tuple: (is_live, message, confidence, annotated_frame, face_count)
         """
-        is_live, message, confidence, bbox = self.verify(frame)
+        is_live, message, confidence, bbox, face_count = self.verify(frame)
         
         # Create annotated frame
         annotated_frame = frame.copy()
         
-        if bbox is not None:
+        if face_count > 1:
+            # Multiple faces detected - show warning
+            cv2.putText(
+                annotated_frame,
+                f"Multiple faces detected ({face_count})",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 165, 255),  # Orange
+                2
+            )
+            cv2.putText(
+                annotated_frame,
+                "Only one person allowed",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 165, 255),
+                2
+            )
+        elif bbox is not None:
             # Choose color based on result
             color = (0, 255, 0) if is_live else (0, 0, 255)
             
@@ -287,7 +389,7 @@ class AntiSpoofingEngine:
                 2
             )
         
-        return is_live, message, confidence, annotated_frame
+        return is_live, message, confidence, annotated_frame, face_count
     
     def reset(self):
         """

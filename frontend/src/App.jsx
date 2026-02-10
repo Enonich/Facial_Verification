@@ -1,15 +1,23 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import './App.css';
+import IDVerificationForm from './IDVerificationForm';
 
 function App() {
   // Navigation state
-  const [activeView, setActiveView] = useState('upload-id');
+  const [activeView, setActiveView] = useState('enter-details');
+
+  // User Details state
+  const [userDetails, setUserDetails] = useState(null);
+  const [detailsSubmitted, setDetailsSubmitted] = useState(false);
 
   // ID Upload state
   const [idImage, setIdImage] = useState(null);
   const [extractedFace, setExtractedFace] = useState(null);
   const [idProcessing, setIdProcessing] = useState(false);
   const [idMessage, setIdMessage] = useState('');
+  const [extractedIdDetails, setExtractedIdDetails] = useState(null);
+  const [idDetailsVerified, setIdDetailsVerified] = useState(false);
+  const [ocrProcessing, setOcrProcessing] = useState(false);
 
   // Liveness & Verification state
   const videoRef = useRef(null);
@@ -23,6 +31,10 @@ function App() {
 
   // Store stream reference for cleanup
   const streamRef = useRef(null);
+  // Store verification start time
+  const verificationStartTimeRef = useRef(null);
+  // Store processing state to prevent overlapping requests
+  const isProcessingRef = useRef(false);
 
   // Start webcam
   const startCamera = async () => {
@@ -97,6 +109,20 @@ function App() {
     console.log('Camera stopped');
   };
 
+  // Handle user details form submission
+  const handleDetailsSubmit = async (formData) => {
+    setUserDetails(formData);
+    setDetailsSubmitted(true);
+    setCurrentStep(1);
+    setActiveView('upload-id');
+  };
+
+  // Handle canceling details entry
+  const handleDetailsCancel = () => {
+    setDetailsSubmitted(false);
+    setUserDetails(null);
+  };
+
   // Handle ID upload
   const handleIdUpload = async (e) => {
     const file = e.target.files[0];
@@ -110,6 +136,7 @@ function App() {
     formData.append('file', file);
 
     try {
+      // Step 1: Extract face from ID
       const response = await fetch('http://localhost:8000/extract-face', {
         method: 'POST',
         body: formData,
@@ -119,8 +146,34 @@ function App() {
       
       if (data.success) {
         setExtractedFace(data.face_image_url);
-        setIdMessage('✓ Face extracted successfully from ID');
+        setIdMessage('✓ Face extracted successfully');
         setCurrentStep(2);
+        
+        // Step 2: Extract text/details from ID using OCR
+        setOcrProcessing(true);
+        setIdMessage('Extracting details from ID document...');
+        
+        const ocrFormData = new FormData();
+        ocrFormData.append('file', file);
+        ocrFormData.append('id_type', userDetails.idType);
+        
+        const ocrResponse = await fetch('http://localhost:8000/ocr-extract', {
+          method: 'POST',
+          body: ocrFormData,
+        });
+        
+        const ocrData = await ocrResponse.json();
+        
+        if (ocrData.success) {
+          setExtractedIdDetails(ocrData.extracted_data);
+          setIdMessage('✓ Details extracted from ID');
+          
+          // Step 3: Verify extracted details against user-entered details
+          await verifyIdDetails(userDetails, ocrData.extracted_data);
+        } else {
+          setIdMessage(`⚠️ Face extracted but could not extract details: ${ocrData.message}`);
+          console.log('OCR extraction warning:', ocrData);
+        }
       } else {
         // Show detailed error message for ID extraction failure
         let errorMsg = data.message || 'Failed to extract face from ID';
@@ -135,6 +188,47 @@ function App() {
       console.error('ID processing error:', err);
     } finally {
       setIdProcessing(false);
+      setOcrProcessing(false);
+    }
+  };
+
+  // Verify extracted ID details against user-entered details
+  const verifyIdDetails = async (details, extractedData) => {
+    try {
+      const verifyFormData = new FormData();
+      verifyFormData.append('user_surname', details.surname || '');
+      verifyFormData.append('user_first_name', details.firstName || '');
+      verifyFormData.append('user_other_names', details.otherNames || '');
+      verifyFormData.append('extracted_surname', extractedData?.surname || '');
+      verifyFormData.append('extracted_first_name', extractedData?.first_name || '');
+      verifyFormData.append('extracted_other_names', extractedData?.other_names || '');
+      verifyFormData.append('id_type', details.idType || '');
+      verifyFormData.append('extracted_id_number', extractedData?.id_number || '');
+      verifyFormData.append('user_id_number', details.idNumber || '');
+      
+      const response = await fetch('http://localhost:8000/verify-id-details', {
+        method: 'POST',
+        body: verifyFormData,
+      });
+      
+      const verifyData = await response.json();
+      
+      if (verifyData.verified) {
+        setIdDetailsVerified(true);
+        setIdMessage(`✓ ID details verified! (Name match: ${verifyData.name_similarity}%)`);
+        setCurrentStep(3);
+      } else {
+        setIdDetailsVerified(false);
+        let errorMsg = verifyData.message || 'ID details do not match';
+        if (verifyData.recommendation) {
+          errorMsg += ` | 💡 ${verifyData.recommendation}`;
+        }
+        setIdMessage(`⚠️ ${errorMsg}`);
+        console.log('ID details verification failed:', verifyData);
+      }
+    } catch (err) {
+      console.error('ID details verification error:', err);
+      setIdMessage(`⚠️ Could not verify ID details: ${err.message}`);
     }
   };
 
@@ -175,6 +269,7 @@ function App() {
       formData.append('file', blob, 'id-capture.jpg');
 
       try {
+        // Step 1: Extract face from ID
         const response = await fetch('http://localhost:8000/extract-face', {
           method: 'POST',
           body: formData,
@@ -184,8 +279,34 @@ function App() {
         
         if (data.success) {
           setExtractedFace(data.face_image_url);
-          setIdMessage('✓ Face extracted successfully from ID');
+          setIdMessage('✓ Face extracted successfully');
           setCurrentStep(2);
+          
+          // Step 2: Extract text/details from ID using OCR
+          setOcrProcessing(true);
+          setIdMessage('Extracting details from ID document...');
+          
+          const ocrFormData = new FormData();
+          ocrFormData.append('file', blob, 'id-capture.jpg');
+          ocrFormData.append('id_type', userDetails.idType);
+          
+          const ocrResponse = await fetch('http://localhost:8000/ocr-extract', {
+            method: 'POST',
+            body: ocrFormData,
+          });
+          
+          const ocrData = await ocrResponse.json();
+          
+          if (ocrData.success) {
+            setExtractedIdDetails(ocrData.extracted_data);
+            setIdMessage('✓ Details extracted from ID');
+            
+            // Step 3: Verify extracted details against user-entered details
+            await verifyIdDetails(userDetails, ocrData.extracted_data);
+          } else {
+            setIdMessage(`⚠️ Face extracted but could not extract details: ${ocrData.message}`);
+            console.log('OCR extraction warning:', ocrData);
+          }
         } else {
           // Show detailed error message for ID extraction failure
           let errorMsg = data.message || 'Failed to extract face from ID';
@@ -200,13 +321,39 @@ function App() {
         console.error('ID processing error:', err);
       } finally {
         setIdProcessing(false);
+        setOcrProcessing(false);
       }
     }, 'image/jpeg', 0.95);
   };
 
   // Perform liveness detection and verification
   const performLivenessAndVerification = useCallback(async () => {
-    if (!canvasRef.current || !videoRef.current) return;
+    if (!canvasRef.current || !videoRef.current || isProcessingRef.current) return;
+    
+    // Mark as processing
+    isProcessingRef.current = true;
+
+    // Check for timeout (30 seconds)
+    if (verificationStartTimeRef.current && (Date.now() - verificationStartTimeRef.current > 30000)) {
+       console.log("Verification timed out");
+       setIsChecking(false);
+       stopCamera();
+       setVerificationResult({
+         verified: false,
+         stage: 'timeout',
+         stageDescription: 'Verification Timeout',
+         error_code: 'TIMEOUT',
+         message: 'Verification timed out after 30 seconds',
+         details: 'Could not verify identity within the time limit.',
+         recommendation: 'Please ensure good lighting and look directly at the camera.'
+       });
+       if (statusMessage.startsWith('✓')) {
+           // If we previously had a success (shouldn't happen here usually), keep it? 
+           // No, validation failed if we hit timeout without stopping.
+       }
+       isProcessingRef.current = false;
+       return;
+    }
 
     const canvas = canvasRef.current;
     const video = videoRef.current;
@@ -217,7 +364,10 @@ function App() {
     ctx.drawImage(video, 0, 0);
 
     canvas.toBlob(async (blob) => {
-      if (!blob) return;
+      if (!blob) {
+          isProcessingRef.current = false;
+          return;
+      }
 
       const formData = new FormData();
       formData.append('file', blob, 'live-frame.jpg');
@@ -231,11 +381,17 @@ function App() {
 
         const livenessData = await livenessResponse.json();
         
+        // Check for multiple faces first
+        if (livenessData.error_code === 'MULTIPLE_FACES') {
+          setStatusMessage(`⚠ ${livenessData.details || 'Multiple faces detected. Only one person allowed.'}`);
+          // Keep retrying
+          return;
+        }
+        
         if (livenessData.is_live) {
           setLivenessStatus('live');
           setStatusMessage('✓ Liveness verified! Checking identity...');
-          setCurrentStep(3);
-
+          
           // Now verify against ID
           const verifyFormData = new FormData();
           verifyFormData.append('live_image', blob, 'live-frame.jpg');
@@ -248,47 +404,38 @@ function App() {
 
           const verifyData = await verifyResponse.json();
           
-          // Enhance verification result with detailed info
-          setVerificationResult(verifyData);
-          setIsChecking(false);
-          stopCamera();
+          // Check for multiple faces in verification
+          if (verifyData.error_code === 'MULTIPLE_FACES') {
+            setStatusMessage(`⚠ ${verifyData.details || 'Multiple faces detected. Only one person allowed.'}`);
+            return;
+          }
           
           if (verifyData.verified) {
-            setStatusMessage('✓ Identity verified successfully!');
+             // SUCCESS: Live AND Verified - Stop immediately
+             setVerificationResult(verifyData);
+             setIsChecking(false);
+             stopCamera();
+             setStatusMessage('✓ Identity verified successfully!');
           } else {
-            // Show detailed failure reason
-            const reason = verifyData.failure_reason || verifyData.match_description || verifyData.message || 'Faces do not match';
-            setStatusMessage(`✗ Verification failed: ${reason}`);
+             // Liveness passed, but Verification failed - KEEP TRYING
+             // Do NOT setVerificationResult (which shows the result screen)
+             // Instead, just update status message/feedback
+             const reason = verifyData.non_match_reason || 'Faces do not match';
+             setStatusMessage(`⏳ Verifying... (${reason})`);
+             // We don't stop camera, loop continues
           }
         } else {
-          // Liveness failed - show detailed message
-          const livenessReason = livenessData.details || livenessData.message || 'Liveness check failed';
-          setStatusMessage(`⚠ ${livenessReason}`);
-          setLivenessStatus('not-live');
-          setVerificationResult({
-            verified: false,
-            stage: 'liveness',
-            stageDescription: livenessData.stage_description || 'Liveness verification',
-            error_code: livenessData.error_code || 'LIVENESS_FAILED',
-            message: livenessData.message,
-            details: livenessData.details,
-            recommendation: livenessData.recommendation,
-            confidence: livenessData.confidence
-          });
+          // Liveness failed - KEEP TRYING
+          const livenessReason = livenessData.details || 'Liveness check failed';
+          setStatusMessage(`⚠ Liveness: ${livenessReason} (Retrying...)`);
+          // We don't stop camera, loop continues
         }
       } catch (err) {
-        setStatusMessage(`Connection error: ${err.message}`);
-        console.error('Verification error:', err);
-        setIsChecking(false);
-        setVerificationResult({
-          verified: false,
-          stage: 'connection',
-          stageDescription: 'API Connection',
-          error_code: 'CONNECTION_ERROR',
-          message: 'Failed to connect to verification server',
-          details: err.message,
-          recommendation: 'Please check your internet connection and try again.'
-        });
+        // Error (network etc) - KEEP TRYING until timeout
+        console.error('Verification attempt error:', err);
+        setStatusMessage('⚠ Connection unstable, retrying...');
+      } finally {
+        isProcessingRef.current = false;
       }
     }, 'image/jpeg', 0.95);
   }, [extractedFace]);
@@ -317,6 +464,8 @@ function App() {
     setLivenessStatus(null);
     setVerificationResult(null);
     setStatusMessage('Starting verification...');
+    verificationStartTimeRef.current = Date.now();
+    isProcessingRef.current = false;
   };
 
   // Reset to start over
@@ -324,6 +473,8 @@ function App() {
     setIdImage(null);
     setExtractedFace(null);
     setIdMessage('');
+    setExtractedIdDetails(null);
+    setIdDetailsVerified(false);
     setLivenessStatus(null);
     setVerificationResult(null);
     setCurrentStep(1);
@@ -331,7 +482,9 @@ function App() {
     stopCamera();
     setIsChecking(false);
     setCameraActive(false);
-    setActiveView('upload-id');
+    setActiveView('enter-details');
+    setUserDetails(null);
+    setDetailsSubmitted(false);
   };
 
   // Cleanup camera on unmount
@@ -361,8 +514,17 @@ function App() {
         
         <nav className="nav-menu">
           <div 
+            className={`nav-item ${activeView === 'enter-details' ? 'active' : ''}`}
+            onClick={() => setActiveView('enter-details')}
+          >
+            <span className="nav-icon">📝</span>
+            <span>Enter Details</span>
+          </div>
+          <div 
             className={`nav-item ${activeView === 'upload-id' ? 'active' : ''}`}
-            onClick={() => setActiveView('upload-id')}
+            onClick={() => {
+              if (detailsSubmitted) setActiveView('upload-id');
+            }}
           >
             <span className="nav-icon">📇</span>
             <span>Upload ID</span>
@@ -370,7 +532,7 @@ function App() {
           <div 
             className={`nav-item ${activeView === 'verify' ? 'active' : ''}`}
             onClick={() => {
-              if (extractedFace) setActiveView('verify');
+              if (idDetailsVerified && extractedFace) setActiveView('verify');
             }}
           >
             <span className="nav-icon">✓</span>
@@ -382,28 +544,74 @@ function App() {
       {/* Main Content Area */}
       <div className="main-content">
         {/* Progress Steps */}
-        <div className="progress-steps">
-          <div className={`step ${currentStep >= 1 ? 'active' : ''} ${currentStep > 1 ? 'completed' : ''}`}>
-            <div className="step-number">{currentStep > 1 ? '✓' : '1'}</div>
-            <div className="step-label">Upload ID</div>
+        {detailsSubmitted && (
+          <div className="progress-steps">
+            <div className={`step ${currentStep >= 1 ? 'active' : ''} ${currentStep > 1 ? 'completed' : ''}`}>
+              <div className="step-number">{currentStep > 1 ? '✓' : '1'}</div>
+              <div className="step-label">Upload ID</div>
+            </div>
+            <div className={`step ${currentStep >= 2 ? 'active' : ''} ${currentStep > 2 ? 'completed' : ''}`}>
+              <div className="step-number">{currentStep > 2 ? '✓' : '2'}</div>
+              <div className="step-label">Verify Details</div>
+            </div>
+            <div className={`step ${currentStep >= 3 ? 'active' : ''}`}>
+              <div className="step-number">3</div>
+              <div className="step-label">Face Verification</div>
+            </div>
           </div>
-          <div className={`step ${currentStep >= 2 ? 'active' : ''} ${currentStep > 2 ? 'completed' : ''}`}>
-            <div className="step-number">{currentStep > 2 ? '✓' : '2'}</div>
-            <div className="step-label">Liveness Check</div>
+        )}
+
+        {/* Enter Details View */}
+        {activeView === 'enter-details' && !detailsSubmitted && (
+          <div className="view-container">
+            <IDVerificationForm 
+              onFormSubmit={handleDetailsSubmit}
+              onCancel={handleDetailsCancel}
+            />
           </div>
-          <div className={`step ${currentStep >= 3 ? 'active' : ''}`}>
-            <div className="step-number">3</div>
-            <div className="step-label">Verify Identity</div>
-          </div>
-        </div>
+        )}
 
         {/* Upload ID View */}
-        {activeView === 'upload-id' && (
+        {activeView === 'upload-id' && detailsSubmitted && (
           <>
             <div className="header">
               <h2>Identity Document Upload</h2>
               <p>Upload or capture your government-issued ID to begin verification</p>
             </div>
+
+            {/* User Details Summary */}
+            {userDetails && (
+              <div className="card" style={{ marginBottom: '1.5rem', backgroundColor: 'rgba(16, 185, 129, 0.1)', borderColor: 'var(--accent-green)' }}>
+                <div className="card-title" style={{ color: 'var(--accent-green)' }}>
+                  <span>📋</span>
+                  Your Details to Match
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                  <div>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Surname</p>
+                    <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{userDetails.surname}</p>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>First Name</p>
+                    <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{userDetails.firstName}</p>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Other Names</p>
+                    <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{userDetails.otherNames || '(none)'}</p>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID Type</p>
+                    <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>
+                      {userDetails.idType === 'GH_CARD' ? 'Ghana Card' : userDetails.idType === 'VOTERS_ID' ? "Voter's ID" : 'Passport'}
+                    </p>
+                  </div>
+                  <div style={{ gridColumn: '1 / -1' }}>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID Number</p>
+                    <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{userDetails.idNumber}</p>
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className="card">
               <div className="card-title">
@@ -479,13 +687,50 @@ function App() {
                       <img src={`http://localhost:8000${extractedFace}`} alt="Extracted Face" />
                     </div>
                   </div>
+
+                  {/* Extracted Details Verification */}
+                  {extractedIdDetails && (
+                    <div className="card" style={{ marginTop: '1.5rem', backgroundColor: idDetailsVerified ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)', borderColor: idDetailsVerified ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                      <div className="card-title" style={{ color: idDetailsVerified ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                        <span>{idDetailsVerified ? '✓' : '⚠️'}</span>
+                        Extracted Information
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                        <div>
+                          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Surname</p>
+                          <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{extractedIdDetails.surname || '(not found)'}</p>
+                        </div>
+                        <div>
+                          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>First Name</p>
+                          <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{extractedIdDetails.first_name || '(not found)'}</p>
+                        </div>
+                        <div>
+                          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Other Names</p>
+                          <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{extractedIdDetails.other_names || '(none)'}</p>
+                        </div>
+                        <div>
+                          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Status</p>
+                          <p style={{ color: idDetailsVerified ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: '500' }}>
+                            {idDetailsVerified ? 'Verified ✓' : 'Mismatch ⚠️'}
+                          </p>
+                        </div>
+                        <div style={{ gridColumn: '1 / -1' }}>
+                          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID Number From Document</p>
+                          <p style={{ color: 'var(--text-primary)', fontWeight: '500' }}>{extractedIdDetails.id_number || '(not found)'}</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="btn-group">
                     <button 
                       className="btn btn-primary" 
                       onClick={() => setActiveView('verify')}
+                      disabled={!idDetailsVerified}
+                      title={idDetailsVerified ? 'Proceed to face verification' : 'Upload ID with matching details to proceed'}
                     >
                       <span>→</span>
-                      Proceed to Verification
+                      {idDetailsVerified ? 'Proceed to Face Verification' : 'Awaiting Details Verification'}
                     </button>
                     <button className="btn btn-secondary" onClick={resetProcess}>
                       Start Over
@@ -607,82 +852,78 @@ function App() {
                     {verificationResult.verified ? 'Identity Verified' : 'Verification Failed'}
                   </div>
                   
-                  {/* Show failure stage indicator (System Errors) */}
-                  {!verificationResult.verified && verificationResult.stage && (
-                    <div className="failure-stage" style={{
-                      background: 'rgba(239, 68, 68, 0.1)',
-                      border: '1px solid rgba(239, 68, 68, 0.3)',
-                      borderRadius: '8px',
-                      padding: '1rem',
-                      marginTop: '1rem',
-                      textAlign: 'left'
+                  {/* Unified Failure Display */}
+                  {!verificationResult.verified && (
+                    <div className="failure-container" style={{
+                      textAlign: 'center',
+                      padding: '1.5rem',
+                      marginTop: '1rem'
                     }}>
-                      <div style={{ marginBottom: '0.5rem' }}>
-                        <strong style={{ color: 'var(--accent-red)' }}>Failed at: </strong>
-                        <span style={{ textTransform: 'capitalize' }}>
-                          {verificationResult.stageDescription || verificationResult.stage}
-                        </span>
+                      <div style={{ 
+                        color: 'var(--accent-red)', 
+                        fontSize: '1.25rem', 
+                        fontWeight: 'bold',
+                        marginBottom: '1rem' 
+                      }}>
+                        Verification Failed
                       </div>
-                      {verificationResult.error_code && (
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
-                          Error Code: {verificationResult.error_code}
-                        </div>
-                      )}
-                      {(verificationResult.failure_reason || verificationResult.match_description || verificationResult.details) && (
-                        <div style={{ marginBottom: '0.5rem' }}>
-                          <strong>Reason: </strong>
-                          {verificationResult.failure_reason || verificationResult.match_description || verificationResult.details}
-                        </div>
-                      )}
-                      {verificationResult.recommendation && (
-                        <div style={{ 
-                          marginTop: '0.75rem', 
-                          padding: '0.75rem', 
-                          background: 'rgba(59, 130, 246, 0.1)', 
-                          borderRadius: '6px',
-                          fontSize: '0.875rem'
-                        }}>
-                          <strong>💡 Recommendation: </strong>
-                          {verificationResult.recommendation}
-                        </div>
+                      
+                      <div style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>
+                        {verificationResult.details || verificationResult.non_match_reason || verificationResult.message || 'Identity could not be verified.'}
+                      </div>
+
+                      <div className="recommendations-box" style={{
+                         background: 'rgba(255, 255, 255, 0.05)',
+                         borderRadius: '8px',
+                         padding: '1.5rem',
+                         textAlign: 'left'
+                      }}>
+                         <div style={{ fontWeight: 'bold', marginBottom: '0.75rem', color: 'var(--text-primary)' }}>
+                           💡 Recommendations to improve success:
+                         </div>
+                         <ul style={{ margin: 0, paddingLeft: '1.5rem', color: 'var(--text-secondary)', lineHeight: '1.6' }}>
+                           <li>Ensure you are in a well-lit area</li>
+                           <li>Remove sunglasses, masks, or hats</li>
+                           <li>Look directly at the camera</li>
+                           <li>Hold the camera steady</li>
+                           <li>Make sure your face is clearly visible</li>
+                           {/* Add specific recommendation if available */}
+                           {verificationResult.recommendation && (
+                              <li style={{ color: 'var(--accent-blue)', fontWeight: '500', marginTop: '0.5rem' }}>
+                                 {verificationResult.recommendation}
+                              </li>
+                           )}
+                         </ul>
+                      </div>
+                      
+                      {/* Debug info (optional, kept small) */}
+                      {verificationResult.error_code && verificationResult.error_code !== 'TIMEOUT' && (
+                         <div style={{ marginTop: '2rem', fontSize: '0.75rem', color: 'var(--text-secondary)', opacity: 0.7 }}>
+                            Internal Code: {verificationResult.error_code}
+                         </div>
                       )}
                     </div>
                   )}
 
-                  {/* Show mismatch details (Verification Completed but Mismatch) */}
-                  {!verificationResult.verified && !verificationResult.error_code && !verificationResult.stage && (
-                    <div className="mismatch-details" style={{
-                      background: 'rgba(245, 158, 11, 0.1)', // Amber background
-                      border: '1px solid rgba(245, 158, 11, 0.3)',
-                      borderRadius: '8px',
-                      padding: '1rem',
-                      marginTop: '1rem',
-                      textAlign: 'left'
-                    }}>
-                       <div style={{ marginBottom: '0.5rem', color: 'var(--text-primary)' }}>
-                          <strong>Result: </strong>
-                          Identity Not Verified
-                       </div>
-
-                      {(verificationResult.non_match_reason || verificationResult.match_description || verificationResult.details) && (
-                        <div style={{ marginBottom: '0.5rem' }}>
-                          <strong>Reason: </strong>
-                          {verificationResult.non_match_reason || verificationResult.match_description || verificationResult.details}
+                  {/* Show Quality Recommendations for Success Case */}
+                  {verificationResult.verified && verificationResult.quality_recommendations && verificationResult.quality_recommendations.length > 0 && (
+                     <div className="success-recommendations" style={{
+                        background: 'rgba(59, 130, 246, 0.1)',
+                        border: '1px solid rgba(59, 130, 246, 0.3)',
+                        borderRadius: '8px',
+                        padding: '1rem',
+                        marginTop: '1rem',
+                        textAlign: 'left'
+                     }}>
+                        <div style={{ fontSize: '0.875rem', fontWeight: 'bold', marginBottom: '0.5rem' }}>
+                           💡 Quality Improvements:
                         </div>
-                      )}
-                      {verificationResult.recommendation && (
-                        <div style={{ 
-                          marginTop: '0.75rem', 
-                          padding: '0.75rem', 
-                          background: 'rgba(59, 130, 246, 0.1)', 
-                          borderRadius: '6px',
-                          fontSize: '0.875rem'
-                        }}>
-                          <strong>💡 Recommendation: </strong>
-                          {verificationResult.recommendation}
-                        </div>
-                      )}
-                    </div>
+                        <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.875rem' }}>
+                           {verificationResult.quality_recommendations.map((rec, i) => (
+                              <li key={i}>{rec}</li>
+                           ))}
+                        </ul>
+                     </div>
                   )}
                   
                   <div className="result-details">

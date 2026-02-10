@@ -12,3 +12,5 @@ pillow
 torch
 torchvision
 easydict
+paddlepaddle
+paddleocr

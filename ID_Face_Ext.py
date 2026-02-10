@@ -296,7 +296,7 @@ if __name__ == "__main__":
 
     # Only provide image_path; output will be named after the ID file
     result = extractor.extract_face(
-        image_path="photos/enoch_pass.jpeg"
+        image_path="photos/Nana Ama McBrown/img24.jpg"
     )
 
     if result:

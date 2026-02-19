@@ -161,4 +161,4 @@ MIT License
 
 ## 👨‍💻 Author
 
-Created for face liveness detection using InsightFace
+Created for a robust facial verification while checking for face liveness detection using InsightFace
